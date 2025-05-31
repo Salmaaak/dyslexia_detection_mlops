@@ -28,8 +28,6 @@ MANIFEST
 .vscode/
 .idea/
 
-# MLflow
-mlruns/
 
 # Environment
 env/

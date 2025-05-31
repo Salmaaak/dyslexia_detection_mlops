@@ -1,0 +1,15 @@
+artifact_uri: file:///C:/Users/dell/Desktop/dyslexia/src/mlruns/198715737682213130/a13175a2ed774233ab87a5907da161ce/artifacts
+end_time: 1748622134859
+entry_point_name: ''
+experiment_id: '198715737682213130'
+lifecycle_stage: active
+run_id: a13175a2ed774233ab87a5907da161ce
+run_name: resilient-crane-215
+run_uuid: a13175a2ed774233ab87a5907da161ce
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1748622125102
+status: 3
+tags: []
+user_id: dell

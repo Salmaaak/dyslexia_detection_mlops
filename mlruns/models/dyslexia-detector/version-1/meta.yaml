@@ -1,0 +1,14 @@
+aliases: []
+creation_timestamp: 1748622394115
+current_stage: Production
+description: null
+last_updated_timestamp: 1748625649703
+name: dyslexia-detector
+run_id: c699828ad90247cf9d52be3aef7ed71d
+run_link: null
+source: runs:/c699828ad90247cf9d52be3aef7ed71d/model
+status: READY
+status_message: null
+storage_location: runs:/c699828ad90247cf9d52be3aef7ed71d/model
+user_id: null
+version: 1
