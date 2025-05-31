@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 import numpy as np
-+ from src.models.model_predict import DyslexiaPredictor
+from src.models.model_predict import DyslexiaPredictor
 
 
 @pytest.fixture
