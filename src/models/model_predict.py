@@ -10,13 +10,24 @@ import time
 logger = logging.getLogger(__name__)
 
 class DyslexiaPredictor:
-    def __init__(self, feature_extractor_path: str, classifier_path: str):
-        self.feature_extractor: Optional[tf.keras.Model] = None
-        self.classifier: Optional[Any] = None
-        self.feature_extractor_path = feature_extractor_path
-        self.classifier_path = classifier_path
-        self._load_models()
-
+    def __init__(self, 
+                feature_extractor_path: Optional[str] = None,
+                classifier_path: Optional[str] = None,
+                feature_extractor: Optional[tf.keras.Model] = None,
+                classifier: Optional[Any] = None):
+        
+        if feature_extractor and classifier:
+            # Direct injection for testing
+            self.feature_extractor = feature_extractor
+            self.classifier = classifier
+        elif feature_extractor_path and classifier_path:
+            # Normal initialization
+            self.feature_extractor_path = feature_extractor_path
+            self.classifier_path = classifier_path
+            self._load_models()
+        else:
+            raise ValueError("Must provide either paths or pre-loaded models")
+    
     def _load_models(self) -> None:
         """Load ML models with retry logic"""
         retries = 3

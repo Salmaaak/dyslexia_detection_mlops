@@ -15,9 +15,29 @@ jobs:
     
     - name: Install dependencies
       run: |
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pytest
+        pip install pytest pytest-cov
+        pip install opencv-python numpy joblib tensorflow scikit-learn
         
-    - name: Run tests
+    - name: Create test models
       run: |
-        python -m pytest tests/
+        python tests/create_test_models.py
+        
+    - name: Run tests with coverage
+      run: |
+        python -m pytest tests/ --cov=src --cov-report=xml
+        
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        
+    - name: Verify test models
+      run: |
+        ls -la tests/test_assets/
+        python -c "import tensorflow as tf; print('Feature extractor valid:', tf.keras.models.load_model('tests/test_assets/mini_feature_extractor.h5').summary())"
+        python -c "from joblib import load; print('Classifier valid:', load('tests/test_assets/mini_classifier.joblib'))"
