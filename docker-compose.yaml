@@ -1,0 +1,35 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models  # This mounts local models dir to /models in container
+
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./static:/app/static
+      - ./mlflow.db:/app/mlflow.db
+    environment:
+      - MLFLOW_TRACKING_URI=sqlite:////app/mlflow.db
+      - MLFLOW_REGISTRY_URI=sqlite:////app/mlflow.db
+    depends_on:
+      - mlflow
+    restart: unless-stopped
+
+  mlflow:
+    build: .  # Build from your Dockerfile instead of using mlflow/mlflow image
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+      - ./mlflow.db:/app/mlflow.db
+    environment:
+      - MLFLOW_TRACKING_URI=sqlite:////app/mlflow.db
+      - MLFLOW_REGISTRY_URI=sqlite:////app/mlflow.db
+    command: >
+      sh -c "mlflow server
+      --backend-store-uri sqlite:////app/mlflow.db
+      --default-artifact-root file:/app/mlruns
+      --host 127.0.0.1"
+    restart: unless-stopped
