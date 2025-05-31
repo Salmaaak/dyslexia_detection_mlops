@@ -9,30 +9,36 @@ jobs:
   retrain:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.11"
-    
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
-        pip install dvc
-        
-    - name: Pull data with DVC
-      run: dvc pull -r myremote
-    
-    - name: Retrain model
-      run: |
-        python src/models/train_model.py --retrain
-        python src/models/register_model.py
-    
-    - name: Commit updated model
-      run: |
-        git config --global user.name "GitHub Actions"
-        git config --global user.email "actions@github.com"
-        git add models/ mlflow.db
-        git commit -m "Update model from automated retraining" || echo "No changes"
-        git push
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install dvc
+
+      - name: Setup DVC
+        run: |
+          dvc remote modify myremote --local auth basic
+          dvc remote modify myremote --local user ${{ github.actor }}
+          dvc remote modify myremote --local password ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull Data
+        run: dvc pull -r myremote
+
+      - name: Retrain model
+        run: |
+          python src/models/train_model.py --retrain
+          python src/models/register_model.py
+
+      - name: Commit updated model
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add models/ mlflow.db
+          git commit -m "Update model from automated retraining" || echo "No changes"
+          git push
