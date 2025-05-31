@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from src.models.model_predict import DyslexiaPredictor
+import cv2
 
 @patch("src.models.model_predict.tf.keras.models.load_model")
 @patch("src.models.model_predict.load")

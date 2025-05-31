@@ -5,6 +5,7 @@ from typing import Dict, Any
 from joblib import load
 import tensorflow as tf
 from fastapi import HTTPException
+import time
 
 logger = logging.getLogger(__name__)
 
