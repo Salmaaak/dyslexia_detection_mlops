@@ -269,14 +269,6 @@ async def monitor_drift(file: UploadFile = File(...)):
             endpoint="/monitor/drift"
         ).observe(time.time() - start_time)
 
-# Your existing HTML response remains unchanged below
-@app.get("/", response_class=HTMLResponse)
-async def main():
-    return HTMLResponse(content="""
-    <html>
-        <!-- Your existing HTML/JS/CSS remains exactly the same -->
-    </html>
-    """)
     
 
 @app.get("/", response_class=HTMLResponse)

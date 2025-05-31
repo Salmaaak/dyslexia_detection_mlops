@@ -38,5 +38,5 @@ RUN mkdir -p /app/data/processed \
 ENV MLFLOW_TRACKING_URI=sqlite:////app/mlflow.db \
     MLFLOW_REGISTRY_URI=sqlite:////app/mlflow.db
 
-EXPOSE 8000 5000
+EXPOSE 8000
 CMD ["uvicorn", "src.app.api:app", "--host", "0.0.0.0", "--port", "8000"]
