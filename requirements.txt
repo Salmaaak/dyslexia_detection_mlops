@@ -12,20 +12,21 @@ joblib>=1.0.0
 dvc==3.41.0
 mlflow==2.10.0
 optuna==3.4.0
-evidently==0.4.8  # Using newer version
+evidently==0.4.8
 shap==0.44.0
 
 # App
 fastapi==0.109.0
 uvicorn==0.27.0
 python-multipart==0.0.6
+pydantic==1.10.13  # Explicitly pin to v1
 
 # Visualization
 matplotlib==3.8.2
 seaborn==0.13.0
 
 # Monitoring
-prometheus-client==0.19.0  # Using newer version
+prometheus-client==0.19.0
 prometheus-fastapi-instrumentator==5.9.1
 
 # Testing

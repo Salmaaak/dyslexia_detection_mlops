@@ -13,11 +13,17 @@ jobs:
       with:
         python-version: "3.11"
     
-    - name: Install dependencies
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1-mesa-glx
+        
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install "pydantic<2.0.0"  # Explicitly install compatible pydantic first
         pip install -r requirements.txt
-        pip install pytest pytest-cov opencv-python numpy joblib tensorflow scikit-learn
+        pip install pytest pytest-cov
         
     - name: Create test models
       run: |
@@ -37,7 +43,7 @@ jobs:
     - name: Upload coverage
       uses: codecov/codecov-action@v3
     
-    - name: Run monitoring tests
+    - name: Verify monitoring imports
       run: |
-        python -c "from src.app.monitoring.metrics import REQUEST_COUNT; print('Monitoring imports working')"
-        python -c "from src.app.monitoring.drift import check_drift; print('Drift detection imports working')"
+        python -c "from src.app.monitoring.metrics import REQUEST_COUNT; print('Monitoring metrics import successful')"
+        python -c "from src.app.monitoring.drift import check_drift; print('Drift detection import successful')"
