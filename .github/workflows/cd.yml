@@ -1,0 +1,36 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'data/**'
+      - 'models/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'requirements.txt'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Build Docker image
+      run: docker-compose build
+    
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+    
+    - name: Push Docker image
+      run: |
+        docker tag your-image-name ${{ secrets.DOCKERHUB_USERNAME }}/dyslexia-detector:latest
+        docker push ${{ secrets.DOCKERHUB_USERNAME }}/dyslexia-detector:latest
+    
+    # Add deployment steps here if you have a remote server
+    # For local deployment, you can add a manual trigger
