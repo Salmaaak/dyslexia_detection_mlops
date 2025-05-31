@@ -160,40 +160,310 @@ async def main():
     <html>
         <head>
             <title>Dyslexia Detection</title>
+            <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
             <style>
-                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-                h1 { color: #2c3e50; }
-                form { margin: 20px 0; }
-                .result { margin-top: 20px; padding: 15px; background: #f8f9fa; border-radius: 5px; }
-                .error { color: red; }
+                :root {
+                    --primary: #4361ee;
+                    --secondary: #3f37c9;
+                    --light: #f8f9fa;
+                    --dark: #212529;
+                    --success: #4cc9f0;
+                    --danger: #f72585;
+                }
+                
+                * {
+                    box-sizing: border-box;
+                    margin: 0;
+                    padding: 0;
+                }
+                
+                body {
+                    font-family: 'Poppins', sans-serif;
+                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    padding: 20px;
+                }
+                
+                .container {
+                    max-width: 800px;
+                    width: 100%;
+                    background: white;
+                    border-radius: 16px;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+                    overflow: hidden;
+                    animation: fadeIn 0.5s ease-out;
+                }
+                
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                
+                .header {
+                    background: var(--primary);
+                    color: white;
+                    padding: 25px;
+                    text-align: center;
+                }
+                
+                .header h1 {
+                    font-weight: 600;
+                    font-size: 28px;
+                    margin-bottom: 5px;
+                }
+                
+                .header p {
+                    opacity: 0.9;
+                    font-weight: 300;
+                }
+                
+                .content {
+                    padding: 30px;
+                }
+                
+                .upload-area {
+                    border: 2px dashed #ccc;
+                    border-radius: 8px;
+                    padding: 30px;
+                    text-align: center;
+                    margin-bottom: 25px;
+                    transition: all 0.3s;
+                    cursor: pointer;
+                }
+                
+                .upload-area:hover {
+                    border-color: var(--primary);
+                    background: rgba(67, 97, 238, 0.05);
+                }
+                
+                .upload-area.highlight {
+                    border-color: var(--primary);
+                    background: rgba(67, 97, 238, 0.05);
+                }
+                
+                .upload-icon {
+                    font-size: 48px;
+                    color: var(--primary);
+                    margin-bottom: 15px;
+                }
+                
+                .btn {
+                    background: var(--primary);
+                    color: white;
+                    border: none;
+                    padding: 12px 24px;
+                    border-radius: 8px;
+                    font-size: 16px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                    display: inline-block;
+                    margin-top: 15px;
+                }
+                
+                .btn:hover {
+                    background: var(--secondary);
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+                }
+                
+                .btn:disabled {
+                    background: #ccc;
+                    cursor: not-allowed;
+                    transform: none;
+                    box-shadow: none;
+                }
+                
+                #fileInput {
+                    display: none;
+                }
+                
+                .result {
+                    margin-top: 30px;
+                    padding: 20px;
+                    border-radius: 8px;
+                    background: var(--light);
+                    display: none;
+                    animation: fadeIn 0.5s ease-out;
+                }
+                
+                .result.show {
+                    display: block;
+                }
+                
+                .result h3 {
+                    color: var(--dark);
+                    margin-bottom: 15px;
+                    font-size: 20px;
+                }
+                
+                .result-item {
+                    display: flex;
+                    justify-content: space-between;
+                    margin-bottom: 10px;
+                    padding-bottom: 10px;
+                    border-bottom: 1px solid #eee;
+                }
+                
+                .result-item:last-child {
+                    border-bottom: none;
+                }
+                
+                .progress-container {
+                    width: 100%;
+                    height: 8px;
+                    background: #e9ecef;
+                    border-radius: 4px;
+                    margin-top: 5px;
+                    overflow: hidden;
+                }
+                
+                .progress-bar {
+                    height: 100%;
+                    border-radius: 4px;
+                    transition: width 0.5s ease-out;
+                }
+                
+                .normal-progress {
+                    background: var(--success);
+                }
+                
+                .reversal-progress {
+                    background: var(--danger);
+                }
+                
+                .error {
+                    background: #fff5f5;
+                    color: var(--danger);
+                    border-left: 4px solid var(--danger);
+                }
+                
+                .loading {
+                    display: none;
+                    text-align: center;
+                    margin: 20px 0;
+                }
+                
+                .spinner {
+                    border: 4px solid rgba(0, 0, 0, 0.1);
+                    border-radius: 50%;
+                    border-top: 4px solid var(--primary);
+                    width: 30px;
+                    height: 30px;
+                    animation: spin 1s linear infinite;
+                    margin: 0 auto 10px;
+                }
+                
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                
+                .file-info {
+                    margin-top: 15px;
+                    font-size: 14px;
+                    color: #666;
+                }
+                
+                footer {
+                    text-align: center;
+                    margin-top: 30px;
+                    font-size: 12px;
+                    color: #666;
+                }
             </style>
         </head>
         <body>
-            <h1>Dyslexia Detection System</h1>
-            <form id="uploadForm" enctype="multipart/form-data">
-                <input type="file" id="fileInput" name="file" accept="image/*" required>
-                <button type="button" onclick="predict()">Analyze</button>
-            </form>
-            <div id="result" class="result" style="display: none;"></div>
+            <div class="container">
+                <div class="header">
+                    <h1>Dyslexia Detection System</h1>
+                    <p>Upload a handwriting sample to analyze for dyslexia indicators</p>
+                </div>
+                
+                <div class="content">
+                    <div class="upload-area" id="uploadArea">
+                        <div class="upload-icon">📁</div>
+                        <h3>Drag & Drop your image here</h3>
+                        <p>or click to browse files</p>
+                        <input type="file" id="fileInput" name="file" accept="image/*" required>
+                        <button class="btn" id="analyzeBtn" disabled>Analyze</button>
+                    </div>
+                    
+                    <div class="file-info" id="fileInfo"></div>
+                    
+                    <div class="loading" id="loading">
+                        <div class="spinner"></div>
+                        <p>Analyzing your image...</p>
+                    </div>
+                    
+                    <div class="result" id="result">
+                        <h3>Analysis Results</h3>
+                        <div id="resultContent"></div>
+                    </div>
+                </div>
+                
+                <footer>
+                    Dyslexia Detection System &copy; 2023
+                </footer>
+            </div>
             
             <script>
-                async function predict() {
-                    const fileInput = document.getElementById('fileInput');
-                    const resultDiv = document.getElementById('result');
-                    resultDiv.innerHTML = '';
-                    resultDiv.classList.remove('error');
-                    
-                    if (!fileInput.files.length) {
-                        showError('Please select an image file');
-                        return;
+                const uploadArea = document.getElementById('uploadArea');
+                const fileInput = document.getElementById('fileInput');
+                const analyzeBtn = document.getElementById('analyzeBtn');
+                const fileInfo = document.getElementById('fileInfo');
+                const loading = document.getElementById('loading');
+                const result = document.getElementById('result');
+                const resultContent = document.getElementById('resultContent');
+                
+                // Handle drag and drop
+                uploadArea.addEventListener('click', () => fileInput.click());
+                
+                fileInput.addEventListener('change', (e) => {
+                    if (e.target.files.length) {
+                        const file = e.target.files[0];
+                        fileInfo.innerHTML = `Selected: <strong>${file.name}</strong> (${(file.size / 1024).toFixed(2)} KB)`;
+                        analyzeBtn.disabled = false;
                     }
+                });
+                
+                uploadArea.addEventListener('dragover', (e) => {
+                    e.preventDefault();
+                    uploadArea.classList.add('highlight');
+                });
+                
+                uploadArea.addEventListener('dragleave', () => {
+                    uploadArea.classList.remove('highlight');
+                });
+                
+                uploadArea.addEventListener('drop', (e) => {
+                    e.preventDefault();
+                    uploadArea.classList.remove('highlight');
+                    
+                    if (e.dataTransfer.files.length) {
+                        fileInput.files = e.dataTransfer.files;
+                        const file = e.dataTransfer.files[0];
+                        fileInfo.innerHTML = `Selected: <strong>${file.name}</strong> (${(file.size / 1024).toFixed(2)} KB)`;
+                        analyzeBtn.disabled = false;
+                    }
+                });
+                
+                analyzeBtn.addEventListener('click', predict);
+                
+                async function predict() {
+                    if (!fileInput.files.length) return;
                     
                     const formData = new FormData();
                     formData.append('file', fileInput.files[0]);
                     
                     try {
-                        resultDiv.innerHTML = 'Processing...';
-                        resultDiv.style.display = 'block';
+                        // Show loading state
+                        loading.style.display = 'block';
+                        result.classList.remove('show');
+                        result.classList.remove('error');
                         
                         const response = await fetch('/predict', {
                             method: 'POST',
@@ -201,33 +471,60 @@ async def main():
                         });
                         
                         if (!response.ok) {
-                            throw new Error(`HTTP error! status: ${response.status}`);
+                            throw new Error(`Error: ${response.statusText}`);
                         }
                         
                         const data = await response.json();
                         
+                        // Hide loading, show results
+                        loading.style.display = 'none';
+                        
                         // Safe property access
                         const prediction = data.prediction ?? 0;
-                        const probs = data.class_probabilities ?? { Normal: 0, Reversal: 0 };
+                        const probs = data.class_probabilities ?? { Normal: 0.5, Reversal: 0.5 };
                         const confidence = data.probability ?? (prediction ? probs.Reversal : probs.Normal);
                         
-                        resultDiv.innerHTML = `
-                            <h3>Results:</h3>
-                            <p>Prediction: ${prediction ? 'Reversal' : 'Normal'}</p>
-                            <p>Confidence: ${(confidence * 100).toFixed(2)}%</p>
-                            <p>Normal Probability: ${(probs.Normal * 100).toFixed(2)}%</p>
-                            <p>Reversal Probability: ${(probs.Reversal * 100).toFixed(2)}%</p>
+                        resultContent.innerHTML = `
+                            <div class="result-item">
+                                <span>Prediction:</span>
+                                <strong style="color: ${prediction ? 'var(--danger)' : 'var(--success)'}">
+                                    ${prediction ? 'Reversal Detected' : 'Normal'}
+                                </strong>
+                            </div>
+                            
+                            <div class="result-item">
+                                <span>Confidence:</span>
+                                <span>${(confidence * 100).toFixed(2)}%</span>
+                            </div>
+                            
+                            <div class="result-item">
+                                <span>Normal Probability:</span>
+                                <span>${(probs.Normal * 100).toFixed(2)}%</span>
+                            </div>
+                            <div class="progress-container">
+                                <div class="progress-bar normal-progress" style="width: ${probs.Normal * 100}%"></div>
+                            </div>
+                            
+                            <div class="result-item">
+                                <span>Reversal Probability:</span>
+                                <span>${(probs.Reversal * 100).toFixed(2)}%</span>
+                            </div>
+                            <div class="progress-container">
+                                <div class="progress-bar reversal-progress" style="width: ${probs.Reversal * 100}%"></div>
+                            </div>
                         `;
+                        
+                        result.classList.add('show');
                     } catch (error) {
-                        showError(error.message);
+                        loading.style.display = 'none';
+                        resultContent.innerHTML = `
+                            <div style="color: var(--danger)">
+                                <strong>Error:</strong> ${error.message}
+                            </div>
+                        `;
+                        result.classList.add('show');
+                        result.classList.add('error');
                     }
-                }
-                
-                function showError(message) {
-                    const resultDiv = document.getElementById('result');
-                    resultDiv.innerHTML = `Error: ${message}`;
-                    resultDiv.style.display = 'block';
-                    resultDiv.classList.add('error');
                 }
             </script>
         </body>
