@@ -2,7 +2,7 @@ name: Retrain Model
 
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Weekly
+    - cron: '0 0 15 * *'  # Weekly
   workflow_dispatch:
 
 jobs:
