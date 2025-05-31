@@ -36,3 +36,8 @@ jobs:
         
     - name: Upload coverage
       uses: codecov/codecov-action@v3
+    
+    - name: Run monitoring tests
+      run: |
+        python -c "from src.monitoring.metrics import REQUEST_COUNT; print('Monitoring imports working')"
+        python -c "from src.monitoring.drift import check_drift; print('Drift detection imports working')"

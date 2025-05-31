@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse
-#from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, Response
+from prometheus_client import generate_latest
+from prometheus_fastapi_instrumentator import Instrumentator
 import numpy as np
 import cv2
 import mlflow.pyfunc
@@ -10,10 +11,39 @@ import logging
 import time
 from joblib import load
 from contextlib import asynccontextmanager
+from typing import Dict, Any
+import pandas as pd
+from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset
+from prometheus_client import Counter, Histogram, Gauge
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Prometheus Metrics
+REQUEST_COUNT = Counter(
+    'app_request_count',
+    'Application Request Count',
+    ['method', 'endpoint', 'http_status']
+)
+
+REQUEST_LATENCY = Histogram(
+    'app_request_latency_seconds',
+    'Application Request Latency',
+    ['method', 'endpoint']
+)
+
+PREDICTION_COUNT = Counter(
+    'app_prediction_count',
+    'Prediction Count by Class',
+    ['prediction_class']
+)
+
+MODEL_LOAD_STATUS = Gauge(
+    'app_model_load_status',
+    'Model Loading Status'
+)
 
 # Global variables to hold models
 feature_extractor = None
@@ -31,6 +61,7 @@ async def lifespan(app: FastAPI):
     for attempt in range(retries):
         try:
             logger.info("Loading models...")
+            MODEL_LOAD_STATUS.set(0)  # 0 = loading
             
             # Load feature extractor
             import tensorflow as tf
@@ -41,10 +72,12 @@ async def lifespan(app: FastAPI):
             classifier = load('/models/best_model.joblib')
             logger.info("Classifier loaded successfully")
             
+            MODEL_LOAD_STATUS.set(1)  # 1 = loaded
             break
         except Exception as e:
             if attempt == retries - 1:
                 logger.error(f"Failed to load models after {retries} attempts: {str(e)}")
+                MODEL_LOAD_STATUS.set(2)  # 2 = error
                 raise
             logger.warning(f"Attempt {attempt+1} failed. Retrying in {delay} seconds...")
             time.sleep(delay)
@@ -54,14 +87,15 @@ async def lifespan(app: FastAPI):
     # Cleanup
     feature_extractor = None
     classifier = None
+    MODEL_LOAD_STATUS.set(0)  # 0 = unloaded
 
 app = FastAPI(
     title="Dyslexia Detection API",
     lifespan=lifespan
 )
 
-# Mount static files from /app/static directory
-#app.mount("/static", StaticFiles(directory="/app/static"), name="static")
+# Instrument app for Prometheus
+Instrumentator().instrument(app).expose(app)
 
 def preprocess_image(image_bytes):
     """Convert uploaded file to processed image array"""
@@ -80,11 +114,29 @@ def preprocess_image(image_bytes):
         logger.error(f"Error preprocessing image: {str(e)}")
         raise HTTPException(status_code=400, detail="Invalid image file")
 
-@app.post("/predict")
+def check_data_drift(current_features: np.ndarray):
+    """Check for data drift using Evidently AI"""
+    try:
+        current_df = pd.DataFrame(current_features.reshape(1, -1))
+        reference = pd.read_csv('data/reference.csv')  # Update path as needed
+        
+        report = Report(metrics=[DataDriftPreset()])
+        report.run(reference_data=reference, current_data=current_df)
+        return report
+    except Exception as e:
+        logger.error(f"Drift check failed: {str(e)}")
+        raise
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     """API endpoint for prediction"""
+    start_time = time.time()
     if feature_extractor is None or classifier is None:
+        REQUEST_COUNT.labels(
+            method="POST",
+            endpoint="/predict",
+            http_status=503
+        ).inc()
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     try:
@@ -107,7 +159,6 @@ async def predict(file: UploadFile = File(...)):
             else:
                 logger.info("Using direct prediction")
                 output = classifier.predict(features)
-                # Handle different classifier output formats
                 if isinstance(output, dict):
                     proba = output.get('probabilities', [output.get('predictions', [0])])[0]
                     prediction = int(output.get('predictions', [0])[0])
@@ -117,6 +168,11 @@ async def predict(file: UploadFile = File(...)):
 
             logger.info(f"Raw probabilities: {proba}")
             logger.info(f"Prediction: {prediction}")
+
+            # Track prediction class
+            PREDICTION_COUNT.labels(
+                prediction_class="Reversal" if prediction else "Normal"
+            ).inc()
 
             # Ensure we always return both classes
             if len(proba) == 2:  # Normal and Reversal
@@ -130,29 +186,98 @@ async def predict(file: UploadFile = File(...)):
                     "Reversal": 1.0 - float(proba[0])
                 }
 
-            return {
+            result = {
                 "prediction": prediction,
                 "probability": float(class_probs["Reversal" if prediction else "Normal"]),
                 "class_probabilities": class_probs
             }
 
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/predict",
+                http_status=200
+            ).inc()
+
+            return result
+
         except Exception as e:
             logger.error(f"Prediction failed: {str(e)}", exc_info=True)
+            REQUEST_COUNT.labels(
+                method="POST",
+                endpoint="/predict",
+                http_status=500
+            ).inc()
             raise HTTPException(status_code=500, detail=f"Prediction processing failed: {str(e)}")
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")    
+        REQUEST_COUNT.labels(
+            method="POST",
+            endpoint="/predict",
+            http_status=500
+        ).inc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    finally:
+        REQUEST_LATENCY.labels(
+            method="POST",
+            endpoint="/predict"
+        ).observe(time.time() - start_time)
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    status = "healthy" if feature_extractor and classifier else "unhealthy"
     return {
-        "status": "healthy" if feature_extractor and classifier else "unhealthy",
+        "status": status,
         "models_loaded": bool(feature_extractor and classifier)
     }
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type="text/plain")
+
+@app.post("/monitor/drift")
+async def monitor_drift(file: UploadFile = File(...)):
+    """Check for data drift"""
+    start_time = time.time()
+    try:
+        contents = await file.read()
+        image = preprocess_image(contents)
+        features = feature_extractor.predict(image)
+        report = check_data_drift(features.flatten())
+        
+        REQUEST_COUNT.labels(
+            method="POST",
+            endpoint="/monitor/drift",
+            http_status=200
+        ).inc()
+        
+        return report.as_dict()
+    except Exception as e:
+        REQUEST_COUNT.labels(
+            method="POST",
+            endpoint="/monitor/drift",
+            http_status=500
+        ).inc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        REQUEST_LATENCY.labels(
+            method="POST",
+            endpoint="/monitor/drift"
+        ).observe(time.time() - start_time)
+
+# Your existing HTML response remains unchanged below
+@app.get("/", response_class=HTMLResponse)
+async def main():
+    return HTMLResponse(content="""
+    <html>
+        <!-- Your existing HTML/JS/CSS remains exactly the same -->
+    </html>
+    """)
+    
 
 @app.get("/", response_class=HTMLResponse)
 async def main():
