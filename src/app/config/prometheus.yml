@@ -1,7 +1,4 @@
-global:
-  scrape_interval: 15s
-
 scrape_configs:
-  - job_name: 'dyslexia_api'
+  - job_name: 'dyslexia-api'
     static_configs:
-      - targets: ['localhost:8080']  # Update with your host
+      - targets: ['api:8000']  # Must match Docker service name

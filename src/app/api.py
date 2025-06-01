@@ -1,25 +1,27 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, Response
-from prometheus_client import generate_latest
+from fastapi.responses import HTMLResponse, Response, JSONResponse
+from prometheus_client import generate_latest, Counter, Histogram, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 import numpy as np
 import cv2
-import mlflow.pyfunc
-import os
-from pathlib import Path
 import logging
 import time
-from joblib import load
 from contextlib import asynccontextmanager
-from typing import Dict, Any
+from typing import Dict, Any, List
 import pandas as pd
-from evidently.report import Report
-from evidently.metric_preset import DataDriftPreset
-from prometheus_client import Counter, Histogram, Gauge
+import psutil
+from datetime import datetime
+from joblib import load
+import tensorflow as tf
+from pathlib import Path  # Added missing import
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ======================
+# Monitoring Setup
+# ======================
 
 # Prometheus Metrics
 REQUEST_COUNT = Counter(
@@ -45,7 +47,19 @@ MODEL_LOAD_STATUS = Gauge(
     'Model Loading Status'
 )
 
-# Global variables to hold models
+PERFORMANCE_QUALITY = Gauge(
+    'app_performance_quality',
+    'Model Performance Quality Score'
+)
+
+# In-memory storage for performance tracking (replace with DB in production)
+performance_data: List[Dict] = []
+reference_data = pd.read_csv('data/reference.csv') if Path('data/reference.csv').exists() else None
+
+# ======================
+# Model Setup
+# ======================
+
 feature_extractor = None
 classifier = None
 
@@ -54,17 +68,16 @@ async def lifespan(app: FastAPI):
     """Lifespan handler for model loading and cleanup"""
     global feature_extractor, classifier
     
-    # Load models
+    MODEL_LOAD_STATUS.set(0)  # 0 = loading
+    
+    # Load models with retry
     retries = 3
     delay = 5
-    
     for attempt in range(retries):
         try:
             logger.info("Loading models...")
-            MODEL_LOAD_STATUS.set(0)  # 0 = loading
             
             # Load feature extractor
-            import tensorflow as tf
             feature_extractor = tf.keras.models.load_model('/models/feature_extractor.h5')
             logger.info("Feature extractor loaded successfully")
             
@@ -78,11 +91,11 @@ async def lifespan(app: FastAPI):
             if attempt == retries - 1:
                 logger.error(f"Failed to load models after {retries} attempts: {str(e)}")
                 MODEL_LOAD_STATUS.set(2)  # 2 = error
-                raise
+                raise HTTPException(status_code=500, detail="Model loading failed")
             logger.warning(f"Attempt {attempt+1} failed. Retrying in {delay} seconds...")
             time.sleep(delay)
     
-    yield  # App runs here
+    yield
     
     # Cleanup
     feature_extractor = None
@@ -94,144 +107,185 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Instrument app for Prometheus
 Instrumentator().instrument(app).expose(app)
 
-def preprocess_image(image_bytes):
+# ======================
+# Core Functions
+# ======================
+
+def preprocess_image(image_bytes: bytes) -> np.ndarray:
     """Convert uploaded file to processed image array"""
     try:
-        # Read image
-        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-        
-        # Resize to match feature extractor input size
-        image = cv2.resize(image, (128, 128))
-        
-        # Normalize and expand dimensions
-        image = np.expand_dims(image, axis=(0, -1)) / 255.0
-        
-        return image
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        if len(nparr) == 0:
+            raise ValueError("Empty image data")
+            
+        image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise ValueError("Invalid image format")
+            
+        return np.expand_dims(cv2.resize(image, (128, 128)), axis=(0, -1)) / 255.0
     except Exception as e:
         logger.error(f"Error preprocessing image: {str(e)}")
-        raise HTTPException(status_code=400, detail="Invalid image file")
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
 
-def check_data_drift(current_features: np.ndarray):
-    """Check for data drift using Evidently AI"""
+def generate_performance_report() -> Dict:
+    """Generate model performance report using Evidently"""
+    if not performance_data or len(performance_data) < 10:  # Need sufficient data
+        return {"error": "Insufficient performance data"}
+    
+    current_df = pd.DataFrame(performance_data[-100:])  # Use last 100 samples
+    ref_df = reference_data if reference_data is not None else pd.DataFrame(performance_data[:100])
+    
     try:
-        current_df = pd.DataFrame(current_features.reshape(1, -1))
-        reference = pd.read_csv('data/reference.csv')  # Update path as needed
+        # Conditional import to handle version conflicts
+        from evidently.report import Report
+        from evidently.metrics import (
+            ClassificationQualityMetric,
+            DataDriftTable,
+            DatasetDriftMetric
+        )
         
-        report = Report(metrics=[DataDriftPreset()])
-        report.run(reference_data=reference, current_data=current_df)
-        return report
+        report = Report(metrics=[
+            ClassificationQualityMetric(),
+            DataDriftTable(),
+            DatasetDriftMetric()
+        ])
+        
+        report.run(reference_data=ref_df, current_data=current_df)
+        return report.as_dict()
+    except ImportError:
+        logger.warning("Evidently not available for performance reporting")
+        return {"error": "Performance reporting not available"}
     except Exception as e:
-        logger.error(f"Drift check failed: {str(e)}")
-        raise
+        logger.error(f"Performance report generation failed: {str(e)}")
+        return {"error": str(e)}
+
+# ======================
+# API Endpoints
+# ======================
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    """API endpoint for prediction"""
+    """Make prediction on image bytes"""
     start_time = time.time()
+    
     if feature_extractor is None or classifier is None:
-        REQUEST_COUNT.labels(
-            method="POST",
-            endpoint="/predict",
-            http_status=503
-        ).inc()
+        REQUEST_COUNT.labels(method="POST", endpoint="/predict", http_status=503).inc()
         raise HTTPException(status_code=503, detail="Models not loaded")
 
     try:
-        # Read and preprocess image
+        # Process image
         contents = await file.read()
         image = preprocess_image(contents)
-
-        # Extract features
-        logger.info("Extracting features...")
         features = feature_extractor.predict(image)
-        logger.info(f"Features shape: {features.shape}")
-
+        
         # Make prediction
-        logger.info("Making prediction...")
-        try:
-            if hasattr(classifier, 'predict_proba'):
-                logger.info("Using predict_proba")
-                proba = classifier.predict_proba(features)[0]
-                prediction = int(classifier.predict(features)[0])
-            else:
-                logger.info("Using direct prediction")
-                output = classifier.predict(features)
-                if isinstance(output, dict):
-                    proba = output.get('probabilities', [output.get('predictions', [0])])[0]
-                    prediction = int(output.get('predictions', [0])[0])
-                else:
-                    proba = [float(output[0]), 1.0 - float(output[0])]
-                    prediction = int(round(output[0]))
+        if hasattr(classifier, 'predict_proba'):
+            proba = classifier.predict_proba(features)[0]
+            prediction = int(classifier.predict(features)[0])
+        else:
+            output = classifier.predict(features)
+            proba = [float(output[0]), 1.0 - float(output[0])]
+            prediction = int(round(output[0]))
 
-            logger.info(f"Raw probabilities: {proba}")
-            logger.info(f"Prediction: {prediction}")
-
-            # Track prediction class
-            PREDICTION_COUNT.labels(
-                prediction_class="Reversal" if prediction else "Normal"
-            ).inc()
-
-            # Ensure we always return both classes
-            if len(proba) == 2:  # Normal and Reversal
-                class_probs = {
-                    "Normal": float(proba[0]),
-                    "Reversal": float(proba[1])
-                }
-            else:  # Handle unexpected cases
-                class_probs = {
-                    "Normal": float(proba[0]),
-                    "Reversal": 1.0 - float(proba[0])
-                }
-
-            result = {
-                "prediction": prediction,
-                "probability": float(class_probs["Reversal" if prediction else "Normal"]),
-                "class_probabilities": class_probs
+        # Track metrics
+        pred_class = "Reversal" if prediction else "Normal"
+        PREDICTION_COUNT.labels(prediction_class=pred_class).inc()
+        
+        # Prepare result
+        result = {
+            "prediction": prediction,
+            "probability": float(proba[1] if len(proba) > 1 else proba[0]),
+            "class_probabilities": {
+                "Normal": float(proba[0]),
+                "Reversal": float(proba[1] if len(proba) > 1 else 1.0 - proba[0])
             }
+        }
 
-            REQUEST_COUNT.labels(
-                method="POST",
-                endpoint="/predict",
-                http_status=200
-            ).inc()
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Prediction failed: {str(e)}", exc_info=True)
-            REQUEST_COUNT.labels(
-                method="POST",
-                endpoint="/predict",
-                http_status=500
-            ).inc()
-            raise HTTPException(status_code=500, detail=f"Prediction processing failed: {str(e)}")
+        # Log performance
+        performance_data.append({
+            "timestamp": datetime.now().isoformat(),
+            "predicted": prediction,
+            "confidence": result["probability"],
+            "actual": 0  # Replace with real ground truth
+        })
+        
+        REQUEST_COUNT.labels(method="POST", endpoint="/predict", http_status=200).inc()
+        return result
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-        REQUEST_COUNT.labels(
-            method="POST",
-            endpoint="/predict",
-            http_status=500
-        ).inc()
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"Prediction failed: {str(e)}", exc_info=True)
+        REQUEST_COUNT.labels(method="POST", endpoint="/predict", http_status=500).inc()
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
     finally:
-        REQUEST_LATENCY.labels(
-            method="POST",
-            endpoint="/predict"
-        ).observe(time.time() - start_time)
+        REQUEST_LATENCY.labels(method="POST", endpoint="/predict").observe(time.time() - start_time)
 
-@app.get("/health")
+@app.get("/monitoring/performance")
+async def get_performance_report():
+    """Get model performance report"""
+    try:
+        report = generate_performance_report()
+        if "error" in report:
+            return JSONResponse(content=report, status_code=400)
+        
+        # Update performance quality metric if available
+        if report.get("metrics"):
+            quality_score = report["metrics"][0]["result"]["accuracy"]  # From ClassificationQualityMetric
+            PERFORMANCE_QUALITY.set(quality_score)
+        
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/monitoring/health")
 async def health_check():
-    """Health check endpoint"""
-    status = "healthy" if feature_extractor and classifier else "unhealthy"
+    """Comprehensive health check endpoint"""
+    try:
+        # Check model status
+        models_loaded = feature_extractor is not None and classifier is not None
+        
+        # Check system resources
+        system_health = {
+            "cpu": psutil.cpu_percent(),
+            "memory": psutil.virtual_memory().percent,
+            "disk": psutil.disk_usage('/').percent
+        }
+        
+        # Check recent performance
+        performance_status = "ok" if len(performance_data) > 0 else "no_data"
+        
+        return {
+            "status": "healthy" if models_loaded else "degraded",
+            "timestamp": datetime.now().isoformat(),
+            "components": {
+                "models": models_loaded,
+                "system": system_health,
+                "performance_tracking": performance_status
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/monitoring/system")
+async def system_health():
+    """System health and resource usage"""
     return {
-        "status": status,
-        "models_loaded": bool(feature_extractor and classifier)
+        "timestamp": datetime.now().isoformat(),
+        "system": {
+            "cpu": psutil.cpu_percent(),
+            "memory": psutil.virtual_memory().percent,
+            "disk": psutil.disk_usage('/').percent
+        },
+        "models": {
+            "status": "loaded" if feature_extractor and classifier else "unloaded",
+            "predictions": {
+                "total": sum([v._value.get() for v in PREDICTION_COUNT._metrics.values()]),
+                "by_class": {k: v._value.get() for k, v in PREDICTION_COUNT._metrics.items()}
+            }
+        }
     }
 
 @app.get("/metrics")
@@ -239,36 +293,7 @@ async def metrics():
     """Prometheus metrics endpoint"""
     return Response(generate_latest(), media_type="text/plain")
 
-@app.post("/monitor/drift")
-async def monitor_drift(file: UploadFile = File(...)):
-    """Check for data drift"""
-    start_time = time.time()
-    try:
-        contents = await file.read()
-        image = preprocess_image(contents)
-        features = feature_extractor.predict(image)
-        report = check_data_drift(features.flatten())
-        
-        REQUEST_COUNT.labels(
-            method="POST",
-            endpoint="/monitor/drift",
-            http_status=200
-        ).inc()
-        
-        return report.as_dict()
-    except Exception as e:
-        REQUEST_COUNT.labels(
-            method="POST",
-            endpoint="/monitor/drift",
-            http_status=500
-        ).inc()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        REQUEST_LATENCY.labels(
-            method="POST",
-            endpoint="/monitor/drift"
-        ).observe(time.time() - start_time)
-
+# ... (keep your existing HTML endpoint) ...
     
 
 @app.get("/", response_class=HTMLResponse)

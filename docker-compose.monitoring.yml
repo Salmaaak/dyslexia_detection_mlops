@@ -1,20 +1,25 @@
-version: '3'
+version: '3.8'
+
 services:
   api:
     image: salma234/dyslexia-detector
     ports:
       - "8000:8000"
-  
-  prometheus:
-    image: prom/prometheus
+    labels:
+      - "netdata.enable=true"  # Enable NetData auto-discovery
+
+  netdata:
+    image: netdata/netdata
     ports:
-      - "9090:9090"
+      - "19999:19999"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-  
-  grafana:
-    image: grafana/grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      - prometheus
+      - netdataconfig:/etc/netdata
+      - /etc/passwd:/host/etc/passwd:ro
+      - /etc/group:/host/etc/group:ro
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+volumes:
+  netdataconfig:
