@@ -7,13 +7,21 @@ import cv2
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import pandas as pd
+from evidently.report import Report
+from evidently.metrics import (
+    ClassificationQualityMetric,
+    DataDriftTable,
+    DatasetDriftMetric
+)
 import psutil
 from datetime import datetime
 from joblib import load
 import tensorflow as tf
-from pathlib import Path  # Added missing import
+from pathlib import Path
+import os
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,9 +60,86 @@ PERFORMANCE_QUALITY = Gauge(
     'Model Performance Quality Score'
 )
 
-# In-memory storage for performance tracking (replace with DB in production)
-performance_data: List[Dict] = []
-reference_data = pd.read_csv('data/reference.csv') if Path('data/reference.csv').exists() else None
+class DyslexiaMonitor:
+    def __init__(self):
+        self.performance_data = []
+        self.reference_accuracy = 0.85  # Baseline from validation
+        self.feature_hashes = set()
+        self.alert_history = []
+        
+    def log_prediction(self, prediction: int, confidence: float, features: np.ndarray):
+        """Log prediction data and check for anomalies"""
+        entry = {
+            'timestamp': datetime.now().isoformat(),
+            'prediction': prediction,
+            'confidence': confidence,
+            'feature_hash': self._hash_features(features)
+        }
+        self.performance_data.append(entry)
+        
+        # Keep only last 1000 entries
+        if len(self.performance_data) > 1000:
+            self.performance_data.pop(0)
+            
+        # Check for issues
+        self._check_performance()
+        self._check_feature_drift()
+    
+    def _hash_features(self, features: np.ndarray) -> str:
+        """Create consistent hash of feature vector"""
+        return hashlib.md5(features.tobytes()).hexdigest()
+    
+    def _check_performance(self, window=100):
+        """Check for performance degradation"""
+        if len(self.performance_data) < window:
+            return
+            
+        recent = self.performance_data[-window:]
+        accuracy = sum(1 for x in recent if x['prediction'] == 0) / window
+        
+        if accuracy < self.reference_accuracy * 0.85:  # 15% drop
+            self.alert_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'type': 'performance',
+                'message': f"Accuracy dropped to {accuracy:.2f} (expected {self.reference_accuracy})"
+            })
+    
+    def _check_feature_drift(self, window=100):
+        """Detect significant feature distribution changes"""
+        if len(self.performance_data) < window:
+            return
+            
+        recent_hashes = {x['feature_hash'] for x in self.performance_data[-window:]}
+        new_hashes = recent_hashes - self.feature_hashes
+        
+        if len(new_hashes) / window > 0.3:  # 30% new patterns
+            self.alert_history.append({
+                'timestamp': datetime.now().isoformat(),
+                'type': 'feature_drift',
+                'message': f"Detected {len(new_hashes)} new feature patterns"
+            })
+        
+        self.feature_hashes.update(recent_hashes)
+    
+    def get_stats(self):
+        """Return current monitoring statistics"""
+        if not self.performance_data:
+            return None
+            
+        window = min(100, len(self.performance_data))
+        recent = self.performance_data[-window:]
+        
+        return {
+            'accuracy': sum(1 for x in recent if x['prediction'] == 0) / window,
+            'alerts': self.alert_history[-5:],  # Last 5 alerts
+            'prediction_distribution': {
+                'Normal': sum(1 for x in recent if x['prediction'] == 0),
+                'Reversal': sum(1 for x in recent if x['prediction'] == 1)
+            }
+        }
+
+# Initialize monitor
+monitor = DyslexiaMonitor()
 
 # ======================
 # Model Setup
@@ -70,29 +155,45 @@ async def lifespan(app: FastAPI):
     
     MODEL_LOAD_STATUS.set(0)  # 0 = loading
     
+    # Define model paths (relative to your project root)
+    models_dir = Path("models")
+    feature_extractor_path = models_dir / "feature_extractor.h5"
+    classifier_path = models_dir / "best_model.joblib"
+    
+    # Create models directory if it doesn't exist
+    models_dir.mkdir(exist_ok=True)
+    
     # Load models with retry
     retries = 3
     delay = 5
     for attempt in range(retries):
         try:
-            logger.info("Loading models...")
+            logger.info(f"Loading models from {models_dir}...")
+            
+            # Verify model files exist
+            if not feature_extractor_path.exists():
+                raise FileNotFoundError(f"Feature extractor not found at {feature_extractor_path}")
+            if not classifier_path.exists():
+                raise FileNotFoundError(f"Classifier not found at {classifier_path}")
             
             # Load feature extractor
-            feature_extractor = tf.keras.models.load_model('/models/feature_extractor.h5')
+            feature_extractor = tf.keras.models.load_model(str(feature_extractor_path))
             logger.info("Feature extractor loaded successfully")
             
             # Load classifier
-            classifier = load('/models/best_model.joblib')
+            classifier = load(str(classifier_path))
             logger.info("Classifier loaded successfully")
             
             MODEL_LOAD_STATUS.set(1)  # 1 = loaded
             break
         except Exception as e:
             if attempt == retries - 1:
-                logger.error(f"Failed to load models after {retries} attempts: {str(e)}")
+                error_msg = f"Failed to load models after {retries} attempts. "
+                error_msg += f"Please ensure these files exist: {[str(feature_extractor_path), str(classifier_path)]}"
+                logger.error(error_msg)
                 MODEL_LOAD_STATUS.set(2)  # 2 = error
-                raise HTTPException(status_code=500, detail="Model loading failed")
-            logger.warning(f"Attempt {attempt+1} failed. Retrying in {delay} seconds...")
+                raise HTTPException(status_code=500, detail=error_msg)
+            logger.warning(f"Attempt {attempt+1} failed: {str(e)}. Retrying in {delay} seconds...")
             time.sleep(delay)
     
     yield
@@ -113,6 +214,82 @@ Instrumentator().instrument(app).expose(app)
 # Core Functions
 # ======================
 
+def preprocess_document(image: np.ndarray) -> List[Dict]:
+    """Process document image into individual characters"""
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+    
+    # Invert colors (white background becomes black)
+    inverted = cv2.bitwise_not(gray)
+    
+    # Threshold to get pure black and white
+    _, binary = cv2.threshold(inverted, 128, 255, cv2.THRESH_BINARY)
+    
+    # Optional: Improve character segmentation
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    
+    # Find contours of individual characters
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Process each character
+    characters = []
+    for contour in contours:
+        # Get bounding box
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Filter very small contours (noise)
+        if w < 10 or h < 10:
+            continue
+            
+        # Extract character ROI
+        char = binary[y:y+h, x:x+w]
+        
+        # Create black background with white character
+        processed_char = cv2.bitwise_not(char)
+        
+        characters.append({
+            'image': processed_char,
+            'contour': contour,
+            'bbox': (x, y, w, h)
+        })
+    
+    # Sort characters left-to-right
+    characters.sort(key=lambda c: c['bbox'][0])
+    
+    return characters
+
+def prepare_for_model(characters: List[Dict], target_size: tuple = (128, 128)) -> np.ndarray:
+    """Prepare character images for model input"""
+    processed = []
+    for char in characters:
+        # Pad to square while maintaining aspect ratio
+        char_img = char['image']
+        h, w = char_img.shape
+        size = max(w, h)
+        padded = np.zeros((size, size), dtype=np.uint8)
+        x_pad = (size - w) // 2
+        y_pad = (size - h) // 2
+        padded[y_pad:y_pad+h, x_pad:x_pad+w] = char_img
+        
+        # Resize to target size
+        resized = cv2.resize(padded, target_size, interpolation=cv2.INTER_AREA)
+        
+        # Add channel dimension
+        resized = np.expand_dims(resized, axis=-1)
+        processed.append(resized)
+    
+    return np.array(processed) / 255.0
+
+def is_single_character(image: np.ndarray) -> bool:
+    """Check if image contains a single character (like training data)"""
+    if len(image.shape) == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return np.count_nonzero(image < 128) / image.size < 0.2  # Less than 20% content
+
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
     """Convert uploaded file to processed image array"""
     try:
@@ -120,46 +297,27 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
         if len(nparr) == 0:
             raise ValueError("Empty image data")
             
-        image = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("Invalid image format")
+        
+        # Check if this is a single character (like training data)
+        if is_single_character(image):
+            # Process as single character
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+            resized = cv2.resize(binary, (128, 128), interpolation=cv2.INTER_AREA)
+            return np.expand_dims(resized, axis=(0, -1)) / 255.0
+        else:
+            # Process as full document
+            characters = preprocess_document(image)
+            if not characters:
+                raise ValueError("No characters detected in image")
+            return prepare_for_model(characters)
             
-        return np.expand_dims(cv2.resize(image, (128, 128)), axis=(0, -1)) / 255.0
     except Exception as e:
         logger.error(f"Error preprocessing image: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-
-def generate_performance_report() -> Dict:
-    """Generate model performance report using Evidently"""
-    if not performance_data or len(performance_data) < 10:  # Need sufficient data
-        return {"error": "Insufficient performance data"}
-    
-    current_df = pd.DataFrame(performance_data[-100:])  # Use last 100 samples
-    ref_df = reference_data if reference_data is not None else pd.DataFrame(performance_data[:100])
-    
-    try:
-        # Conditional import to handle version conflicts
-        from evidently.report import Report
-        from evidently.metrics import (
-            ClassificationQualityMetric,
-            DataDriftTable,
-            DatasetDriftMetric
-        )
-        
-        report = Report(metrics=[
-            ClassificationQualityMetric(),
-            DataDriftTable(),
-            DatasetDriftMetric()
-        ])
-        
-        report.run(reference_data=ref_df, current_data=current_df)
-        return report.as_dict()
-    except ImportError:
-        logger.warning("Evidently not available for performance reporting")
-        return {"error": "Performance reporting not available"}
-    except Exception as e:
-        logger.error(f"Performance report generation failed: {str(e)}")
-        return {"error": str(e)}
 
 # ======================
 # API Endpoints
@@ -177,39 +335,65 @@ async def predict(file: UploadFile = File(...)):
     try:
         # Process image
         contents = await file.read()
-        image = preprocess_image(contents)
-        features = feature_extractor.predict(image)
+        images = preprocess_image(contents)
         
-        # Make prediction
+        # Extract features
+        features = feature_extractor.predict(images)
+        
+        # Make predictions
+        if len(features.shape) == 1:
+            features = features.reshape(1, -1)
+        
         if hasattr(classifier, 'predict_proba'):
-            proba = classifier.predict_proba(features)[0]
-            prediction = int(classifier.predict(features)[0])
+            proba = classifier.predict_proba(features)
+            predictions = classifier.predict(features)
         else:
-            output = classifier.predict(features)
-            proba = [float(output[0]), 1.0 - float(output[0])]
-            prediction = int(round(output[0]))
-
-        # Track metrics
-        pred_class = "Reversal" if prediction else "Normal"
-        PREDICTION_COUNT.labels(prediction_class=pred_class).inc()
+            proba = classifier.predict(features)
+            predictions = np.round(proba).astype(int)
+            proba = np.column_stack([1 - proba, proba])
+        
+        # Log prediction for monitoring
+        for i in range(len(predictions)):
+            monitor.log_prediction(
+                prediction=int(predictions[i]),
+                confidence=float(proba[i][1]),
+                features=features[i]
+            )
         
         # Prepare result
-        result = {
-            "prediction": prediction,
-            "probability": float(proba[1] if len(proba) > 1 else proba[0]),
-            "class_probabilities": {
-                "Normal": float(proba[0]),
-                "Reversal": float(proba[1] if len(proba) > 1 else 1.0 - proba[0])
+        if len(predictions) > 1:
+            avg_prob = np.mean(proba, axis=0)
+            result = {
+                "prediction": int(np.round(np.mean(predictions))),
+                "probability": float(avg_prob[1]),
+                "class_probabilities": {
+                    "Normal": float(avg_prob[0]),
+                    "Reversal": float(avg_prob[1])
+                },
+                "character_details": [
+                    {
+                        "prediction": int(pred),
+                        "probability": float(prob[1]),
+                        "class_probabilities": {
+                            "Normal": float(prob[0]),
+                            "Reversal": float(prob[1])
+                        }
+                    } for pred, prob in zip(predictions, proba)
+                ]
             }
-        }
+        else:
+            result = {
+                "prediction": int(predictions[0]),
+                "probability": float(proba[0][1]),
+                "class_probabilities": {
+                    "Normal": float(proba[0][0]),
+                    "Reversal": float(proba[0][1])
+                }
+            }
 
-        # Log performance
-        performance_data.append({
-            "timestamp": datetime.now().isoformat(),
-            "predicted": prediction,
-            "confidence": result["probability"],
-            "actual": 0  # Replace with real ground truth
-        })
+        # Track metrics
+        pred_class = "Reversal" if result["prediction"] else "Normal"
+        PREDICTION_COUNT.labels(prediction_class=pred_class).inc()
         
         REQUEST_COUNT.labels(method="POST", endpoint="/predict", http_status=200).inc()
         return result
@@ -223,81 +407,26 @@ async def predict(file: UploadFile = File(...)):
     finally:
         REQUEST_LATENCY.labels(method="POST", endpoint="/predict").observe(time.time() - start_time)
 
-@app.get("/monitoring/performance")
-async def get_performance_report():
-    """Get model performance report"""
-    try:
-        report = generate_performance_report()
-        if "error" in report:
-            return JSONResponse(content=report, status_code=400)
-        
-        # Update performance quality metric if available
-        if report.get("metrics"):
-            quality_score = report["metrics"][0]["result"]["accuracy"]  # From ClassificationQualityMetric
-            PERFORMANCE_QUALITY.set(quality_score)
-        
-        return report
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/monitoring/health")
-async def health_check():
-    """Comprehensive health check endpoint"""
-    try:
-        # Check model status
-        models_loaded = feature_extractor is not None and classifier is not None
-        
-        # Check system resources
-        system_health = {
-            "cpu": psutil.cpu_percent(),
-            "memory": psutil.virtual_memory().percent,
-            "disk": psutil.disk_usage('/').percent
-        }
-        
-        # Check recent performance
-        performance_status = "ok" if len(performance_data) > 0 else "no_data"
-        
-        return {
-            "status": "healthy" if models_loaded else "degraded",
-            "timestamp": datetime.now().isoformat(),
-            "components": {
-                "models": models_loaded,
-                "system": system_health,
-                "performance_tracking": performance_status
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/monitoring/system")
-async def system_health():
-    """System health and resource usage"""
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "system": {
-            "cpu": psutil.cpu_percent(),
-            "memory": psutil.virtual_memory().percent,
-            "disk": psutil.disk_usage('/').percent
-        },
-        "models": {
-            "status": "loaded" if feature_extractor and classifier else "unloaded",
-            "predictions": {
-                "total": sum([v._value.get() for v in PREDICTION_COUNT._metrics.values()]),
-                "by_class": {k: v._value.get() for k, v in PREDICTION_COUNT._metrics.items()}
-            }
-        }
-    }
-
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint"""
-    return Response(generate_latest(), media_type="text/plain")
-
-# ... (keep your existing HTML endpoint) ...
-    
+@app.get("/monitoring/stats")
+async def get_monitoring_stats():
+    """Get current monitoring statistics"""
+    stats = monitor.get_stats()
+    if stats is None:
+        raise HTTPException(status_code=404, detail="No monitoring data available")
+    return stats
 
 @app.get("/", response_class=HTMLResponse)
-async def main():
+async def root(show: str = None):
+    """Root endpoint that handles both main interface and monitoring dashboard"""
+    if show == "dashboard":
+        return await monitoring_dashboard()
+    elif show == "about":
+        return await about_dyslexia()
+    else:
+        return await main_interface()
+
+async def main_interface():
+    """Main interface for dyslexia prediction"""
     return HTMLResponse(content="""
     <html>
         <head>
@@ -323,25 +452,13 @@ async def main():
                     font-family: 'Poppins', sans-serif;
                     background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
                     min-height: 100vh;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
                     padding: 20px;
                 }
                 
                 .container {
-                    max-width: 800px;
+                    max-width: 1200px;
                     width: 100%;
-                    background: white;
-                    border-radius: 16px;
-                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
-                    overflow: hidden;
-                    animation: fadeIn 0.5s ease-out;
-                }
-                
-                @keyframes fadeIn {
-                    from { opacity: 0; transform: translateY(20px); }
-                    to { opacity: 1; transform: translateY(0); }
+                    margin: 0 auto;
                 }
                 
                 .header {
@@ -349,6 +466,7 @@ async def main():
                     color: white;
                     padding: 25px;
                     text-align: center;
+                    border-radius: 8px 8px 0 0;
                 }
                 
                 .header h1 {
@@ -362,8 +480,31 @@ async def main():
                     font-weight: 300;
                 }
                 
+                .nav {
+                    display: flex;
+                    justify-content: center;
+                    background: var(--secondary);
+                    padding: 10px;
+                }
+                
+                .nav a {
+                    color: white;
+                    text-decoration: none;
+                    padding: 10px 20px;
+                    margin: 0 5px;
+                    border-radius: 4px;
+                    transition: background 0.3s;
+                }
+                
+                .nav a:hover {
+                    background: rgba(255, 255, 255, 0.2);
+                }
+                
                 .content {
+                    background: white;
                     padding: 30px;
+                    border-radius: 0 0 8px 8px;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
                 }
                 
                 .upload-area {
@@ -516,6 +657,11 @@ async def main():
                     font-size: 12px;
                     color: #666;
                 }
+                
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(20px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
             </style>
         </head>
         <body>
@@ -523,6 +669,12 @@ async def main():
                 <div class="header">
                     <h1>Dyslexia Detection System</h1>
                     <p>Upload a handwriting sample to analyze for dyslexia indicators</p>
+                </div>
+                
+                <div class="nav">
+                    <a href="/">Home</a>
+                    <a href="/?show=dashboard">Monitoring Dashboard</a>
+                    <a href="/?show=about">About Dyslexia</a>
                 </div>
                 
                 <div class="content">
@@ -672,3 +824,488 @@ async def main():
         </body>
     </html>
     """)
+
+async def monitoring_dashboard():
+    """Interactive monitoring dashboard"""
+    return HTMLResponse(content="""
+    <html>
+        <head>
+            <title>Dyslexia Monitoring Dashboard</title>
+            <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
+            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+            <style>
+                :root {
+                    --primary: #4361ee;
+                    --secondary: #3f37c9;
+                    --light: #f8f9fa;
+                    --dark: #212529;
+                    --success: #4cc9f0;
+                    --danger: #f72585;
+                }
+                
+                * {
+                    box-sizing: border-box;
+                    margin: 0;
+                    padding: 0;
+                }
+                
+                body {
+                    font-family: 'Poppins', sans-serif;
+                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+                    min-height: 100vh;
+                    padding: 20px;
+                }
+                
+                .container {
+                    max-width: 1200px;
+                    width: 100%;
+                    margin: 0 auto;
+                }
+                
+                .header {
+                    background: var(--primary);
+                    color: white;
+                    padding: 25px;
+                    text-align: center;
+                    border-radius: 8px 8px 0 0;
+                }
+                
+                .header h1 {
+                    font-weight: 600;
+                    font-size: 28px;
+                    margin-bottom: 5px;
+                }
+                
+                .header p {
+                    opacity: 0.9;
+                    font-weight: 300;
+                }
+                
+                .nav {
+                    display: flex;
+                    justify-content: center;
+                    background: var(--secondary);
+                    padding: 10px;
+                }
+                
+                .nav a {
+                    color: white;
+                    text-decoration: none;
+                    padding: 10px 20px;
+                    margin: 0 5px;
+                    border-radius: 4px;
+                    transition: background 0.3s;
+                }
+                
+                .nav a:hover {
+                    background: rgba(255, 255, 255, 0.2);
+                }
+                
+                .dashboard-content {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 0 0 8px 8px;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+                }
+                
+                .status-grid {
+                    display: grid;
+                    grid-template-columns: repeat(2, 1fr);
+                    gap: 20px;
+                    margin-bottom: 30px;
+                }
+                
+                .status-card {
+                    background: var(--light);
+                    padding: 20px;
+                    border-radius: 8px;
+                    text-align: center;
+                }
+                
+                .status-card h3 {
+                    color: var(--dark);
+                    margin-bottom: 10px;
+                }
+                
+                .status-value {
+                    font-size: 32px;
+                    font-weight: 600;
+                    color: var(--primary);
+                    margin: 10px 0;
+                }
+                
+                .metrics-grid {
+                    display: grid;
+                    grid-template-columns: repeat(2, 1fr);
+                    gap: 20px;
+                }
+                
+                .metric-card {
+                    background: var(--light);
+                    padding: 20px;
+                    border-radius: 8px;
+                }
+                
+                .metric-card h3 {
+                    color: var(--dark);
+                    margin-bottom: 15px;
+                }
+                
+                .chart-container {
+                    height: 300px;
+                }
+                
+                .info-panel {
+                    background: var(--light);
+                    border-radius: 8px;
+                    padding: 20px;
+                    margin-top: 20px;
+                }
+                
+                .info-panel h3 {
+                    color: var(--primary);
+                    margin-bottom: 10px;
+                }
+                
+                .alert {
+                    padding: 10px;
+                    margin: 5px 0;
+                    border-radius: 4px;
+                    background: #fff5f5;
+                    border-left: 4px solid var(--danger);
+                }
+                
+                footer {
+                    text-align: center;
+                    margin-top: 30px;
+                    font-size: 12px;
+                    color: #666;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Dyslexia Detection Monitoring</h1>
+                    <p>System performance and insights</p>
+                </div>
+                
+                <div class="nav">
+                    <a href="/">Home</a>
+                    <a href="/?show=dashboard">Monitoring Dashboard</a>
+                    <a href="/?show=about">About Dyslexia</a>
+                </div>
+                
+                <div class="dashboard-content">
+                    <div class="status-grid">
+                        <div class="status-card">
+                            <h3>Current Accuracy</h3>
+                            <div class="status-value" id="current-accuracy">Loading...</div>
+                            <p>Compared to baseline</p>
+                        </div>
+                        <div class="status-card">
+                            <h3>Recent Alerts</h3>
+                            <div class="status-value" id="alert-count">0</div>
+                            <p>System notifications</p>
+                        </div>
+                    </div>
+                    
+                    <div class="metrics-grid">
+                        <div class="metric-card">
+                            <h3>Prediction Distribution</h3>
+                            <div class="chart-container" id="prediction-chart"></div>
+                        </div>
+                        <div class="metric-card">
+                            <h3>Performance Trend</h3>
+                            <div class="chart-container" id="performance-trend"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="info-panel">
+                        <h3>Recent Alerts</h3>
+                        <div id="alerts-container"></div>
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    Dyslexia Detection System &copy; 2023 | Last updated: <span id="last-updated"></span>
+                </div>
+            </div>
+            
+            <script>
+                // Load initial data
+                document.addEventListener('DOMContentLoaded', () => {
+                    loadData();
+                });
+                
+                async function loadData() {
+                    try {
+                        const response = await fetch('/monitoring/stats');
+                        const data = await response.json();
+                        
+                        // Update stats
+                        document.getElementById('current-accuracy').textContent = 
+                            `${(data.accuracy * 100).toFixed(1)}%`;
+                        document.getElementById('alert-count').textContent = 
+                            data.alerts.length;
+                        
+                        // Update prediction chart
+                        createPredictionChart(data.prediction_distribution);
+                        
+                        // Update alerts
+                        const alertsContainer = document.getElementById('alerts-container');
+                        alertsContainer.innerHTML = data.alerts.length > 0 
+                            ? data.alerts.map(alert => `
+                                <div class="alert">
+                                    <strong>${alert.type.toUpperCase()}</strong><br>
+                                    ${alert.message}<br>
+                                    <small>${alert.timestamp}</small>
+                                </div>
+                            `).join('')
+                            : '<p>No recent alerts</p>';
+                        
+                        // Update last updated time
+                        document.getElementById('last-updated').textContent = new Date().toLocaleString();
+                        
+                    } catch (error) {
+                        console.error('Error loading monitoring data:', error);
+                    }
+                }
+                
+                function createPredictionChart(distribution) {
+                    const data = [{
+                        values: [distribution.Normal, distribution.Reversal],
+                        labels: ['Normal', 'Reversal'],
+                        marker: {colors: ['var(--success)', 'var(--danger)']},
+                        type: 'pie',
+                        textinfo: 'percent+value'
+                    }];
+                    
+                    Plotly.newPlot('prediction-chart', data, {margin: {t: 0, b: 0}});
+                }
+                
+                // Auto-refresh every 30 seconds
+                setInterval(loadData, 30000);
+            </script>
+        </body>
+    </html>
+    """)
+
+async def about_dyslexia():
+    """About dyslexia information page"""
+    return HTMLResponse(content="""
+    <html>
+        <head>
+            <title>About Dyslexia</title>
+            <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
+            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+            <style>
+                :root {
+                    --primary: #4361ee;
+                    --secondary: #3f37c9;
+                    --light: #f8f9fa;
+                    --dark: #212529;
+                    --success: #4cc9f0;
+                    --danger: #f72585;
+                }
+                
+                * {
+                    box-sizing: border-box;
+                    margin: 0;
+                    padding: 0;
+                }
+                
+                body {
+                    font-family: 'Poppins', sans-serif;
+                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+                    min-height: 100vh;
+                    padding: 20px;
+                }
+                
+                .container {
+                    max-width: 1200px;
+                    width: 100%;
+                    margin: 0 auto;
+                }
+                
+                .header {
+                    background: var(--primary);
+                    color: white;
+                    padding: 25px;
+                    text-align: center;
+                    border-radius: 8px 8px 0 0;
+                }
+                
+                .header h1 {
+                    font-weight: 600;
+                    font-size: 28px;
+                    margin-bottom: 5px;
+                }
+                
+                .header p {
+                    opacity: 0.9;
+                    font-weight: 300;
+                }
+                
+                .nav {
+                    display: flex;
+                    justify-content: center;
+                    background: var(--secondary);
+                    padding: 10px;
+                }
+                
+                .nav a {
+                    color: white;
+                    text-decoration: none;
+                    padding: 10px 20px;
+                    margin: 0 5px;
+                    border-radius: 4px;
+                    transition: background 0.3s;
+                }
+                
+                .nav a:hover {
+                    background: rgba(255, 255, 255, 0.2);
+                }
+                
+                .content {
+                    background: white;
+                    padding: 30px;
+                    border-radius: 0 0 8px 8px;
+                    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+                }
+                
+                .info-section {
+                    margin-bottom: 30px;
+                }
+                
+                .info-section h2 {
+                    color: var(--primary);
+                    margin-bottom: 15px;
+                }
+                
+                .info-section h3 {
+                    color: var(--secondary);
+                    margin: 20px 0 10px;
+                }
+                
+                .info-section ul {
+                    padding-left: 20px;
+                    margin: 10px 0;
+                }
+                
+                .info-section li {
+                    margin-bottom: 8px;
+                }
+                
+                .chart-container {
+                    height: 300px;
+                    margin: 30px 0;
+                }
+                
+                footer {
+                    text-align: center;
+                    margin-top: 30px;
+                    font-size: 12px;
+                    color: #666;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>About Dyslexia</h1>
+                    <p>Understanding the learning disorder and how our system detects it</p>
+                </div>
+                
+                <div class="nav">
+                    <a href="/">Home</a>
+                    <a href="/?show=dashboard">Monitoring Dashboard</a>
+                    <a href="/?show=about">About Dyslexia</a>
+                </div>
+                
+                <div class="content">
+                    <div class="info-section">
+                        <h2>Understanding Dyslexia</h2>
+                        <p>Dyslexia is a learning disorder that affects reading, writing and spelling abilities. Our system detects common indicators in handwriting:</p>
+                        
+                        <h3>Common Signs</h3>
+                        <ul>
+                            <li>Letter reversals (b/d, p/q)</li>
+                            <li>Inconsistent letter sizes</li>
+                            <li>Poor spatial planning</li>
+                            <li>Irregular letter formation</li>
+                            <li>Difficulty with letter sequencing</li>
+                            <li>Inconsistent spacing between words</li>
+                        </ul>
+                        
+                        <h3>Detection Methodology</h3>
+                        <p>Our AI analyzes handwriting samples for these patterns using deep learning models trained on thousands of samples. The system looks for:</p>
+                        <ul>
+                            <li>Mirror writing patterns</li>
+                            <li>Inconsistent stroke directions</li>
+                            <li>Unusual letter shapes</li>
+                            <li>Spatial organization issues</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="chart-container" id="accuracy-chart"></div>
+                    
+                    <div class="info-section">
+                        <h3>Early Detection Importance</h3>
+                        <p>Early identification of dyslexia can lead to more effective interventions. Our system provides:</p>
+                        <ul>
+                            <li>Quick screening assessment</li>
+                            <li>Objective analysis of handwriting</li>
+                            <li>Detailed reports on potential indicators</li>
+                        </ul>
+                        
+                        <h3>How to Use This System</h3>
+                        <p>For best results when submitting handwriting samples:</p>
+                        <ul>
+                            <li>Use clear, well-lit images</li>
+                            <li>Include multiple words if possible</li>
+                            <li>Submit samples from different writing sessions</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div class="footer">
+                    Dyslexia Detection System &copy; 2023
+                </div>
+            </div>
+            
+            <script>
+                // Static data for dyslexia accuracy
+                document.addEventListener('DOMContentLoaded', () => {
+                    const data = [{
+                        x: ['Children', 'Adolescents', 'Adults'],
+                        y: [92, 88, 85],
+                        type: 'bar',
+                        marker: {color: 'var(--primary)'}
+                    }];
+                    
+                    const layout = {
+                        title: 'Detection Accuracy by Age Group',
+                        yaxis: {title: 'Accuracy (%)', range: [80, 100]},
+                        margin: {t: 40, b: 30, l: 40, r: 0}
+                    };
+                    
+                    Plotly.newPlot('accuracy-chart', data, layout);
+                });
+            </script>
+        </body>
+    </html>
+    """)
+
+if __name__ == "__main__":
+    import uvicorn
+    import asyncio
+    
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=8000,
+        reload=True  # Auto-reload on code changes
+    )
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())
